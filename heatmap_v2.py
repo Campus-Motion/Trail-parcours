@@ -68,12 +68,15 @@ def unproject(x, y, scale):
 
 
 # ---------------------------------------------------------------- lecture
-def load_tracks(fit_dir):
+def load_tracks(fit_dir, *, strict=False):
     tracks = []
     for file_path in sorted(fit_dir.glob("*.fit")):
         pts = []
         try:
-            with fitdecode.FitReader(file_path) as fit:
+            reader_options = ({"check_crc": fitdecode.CrcCheck.RAISE,
+                               "error_handling": fitdecode.ErrorHandling.RAISE}
+                              if strict else {})
+            with fitdecode.FitReader(file_path, **reader_options) as fit:
                 for frame in fit:
                     if not (isinstance(frame, fitdecode.FitDataMessage) and frame.name == "record"):
                         continue
@@ -88,6 +91,8 @@ def load_tracks(fit_dir):
                         continue
                     pts.append((ts, la * SEMICIRCLE, lo * SEMICIRCLE))
         except Exception as e:
+            if strict:
+                raise ValueError(f"Invalid FIT file: {file_path.name}") from e
             print(f"Erreur fichier {file_path.name} : {e}")
 
         if len(pts) >= 2:
@@ -171,7 +176,9 @@ def rasterize(x, y, t, x0, ytop, pixel_m, shape):
     # Conversion de la distance physique accumulée en "équivalent de passages"
     return layer / pixel_m
 
-def compute_heat(tracks):
+def compute_heat(tracks, *, max_side_px=MAX_SIDE_PX):
+    if max_side_px <= 5:
+        raise ValueError("max_side_px must be greater than 5")
     all_lat = np.concatenate([t[1] for t in tracks])
     ref_lat = float(all_lat.mean())
     scale = cos(radians(ref_lat))
@@ -189,8 +196,10 @@ def compute_heat(tracks):
 
     pixel_m = PIXEL_M
     extent = max(all_x.max() - all_x.min(), all_y.max() - all_y.min())
-    if extent / pixel_m > MAX_SIDE_PX:
-        pixel_m = extent / MAX_SIDE_PX
+    # Include blur margins and one pixel of rounding headroom in the limit.
+    required_pixel_m = (extent + 8 * BLUR_M) / (max_side_px - 5)
+    if required_pixel_m > pixel_m:
+        pixel_m = required_pixel_m
         print(f"Zone très étendue : pixel porté à {pixel_m:.1f} m pour limiter la taille de l'image.")
 
     margin = 4 * BLUR_M + 2 * pixel_m
