@@ -68,35 +68,44 @@ def unproject(x, y, scale):
 
 
 # ---------------------------------------------------------------- lecture
+class FitPointLimitError(ValueError):
+    pass
+
+
+def read_fit_points(file_path, *, strict=False, max_points=None):
+    """Decode only timestamped GPS records; never retain sensor/health fields."""
+    pts = []
+    options = ({"check_crc": fitdecode.CrcCheck.RAISE,
+                "error_handling": fitdecode.ErrorHandling.RAISE} if strict else {})
+    with fitdecode.FitReader(file_path, **options) as fit:
+        for frame in fit:
+            if not (isinstance(frame, fitdecode.FitDataMessage) and frame.name == "record"):
+                continue
+            if not all(frame.has_field(name) for name in
+                       ("position_lat", "position_long", "timestamp")):
+                continue
+            la, lo, ts = (frame.get_value(name) for name in
+                          ("position_lat", "position_long", "timestamp"))
+            if la is None or lo is None or ts is None:
+                continue
+            pts.append((ts, la * SEMICIRCLE, lo * SEMICIRCLE))
+            if max_points is not None and len(pts) > max_points:
+                raise FitPointLimitError("Too many GPS points")
+    pts.sort(key=lambda point: point[0])
+    return pts
+
+
 def load_tracks(fit_dir, *, strict=False):
     tracks = []
     for file_path in sorted(fit_dir.glob("*.fit")):
-        pts = []
         try:
-            reader_options = ({"check_crc": fitdecode.CrcCheck.RAISE,
-                               "error_handling": fitdecode.ErrorHandling.RAISE}
-                              if strict else {})
-            with fitdecode.FitReader(file_path, **reader_options) as fit:
-                for frame in fit:
-                    if not (isinstance(frame, fitdecode.FitDataMessage) and frame.name == "record"):
-                        continue
-                    if not (frame.has_field("position_lat")
-                            and frame.has_field("position_long")
-                            and frame.has_field("timestamp")):
-                        continue
-                    la = frame.get_value("position_lat")
-                    lo = frame.get_value("position_long")
-                    ts = frame.get_value("timestamp")
-                    if la is None or lo is None or ts is None:
-                        continue
-                    pts.append((ts, la * SEMICIRCLE, lo * SEMICIRCLE))
+            pts = read_fit_points(file_path, strict=strict)
         except Exception as e:
             if strict:
                 raise ValueError(f"Invalid FIT file: {file_path.name}") from e
             print(f"Erreur fichier {file_path.name} : {e}")
-
+            continue
         if len(pts) >= 2:
-            pts.sort(key=lambda p: p[0])
             t0 = pts[0][0]
             t = np.array([(p[0] - t0).total_seconds() for p in pts])
             lat = np.array([p[1] for p in pts])

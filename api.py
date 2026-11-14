@@ -7,7 +7,7 @@ from typing import Annotated, Literal
 import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 import heatmap_v2 as heatmap
 
@@ -50,16 +50,8 @@ def create_heatmap(
         total_bytes = total_points = 0
         with TemporaryDirectory(prefix="trail-heatmap-") as directory:
             for index, upload in enumerate(files):
-                if not (upload.filename or "").lower().endswith(".fit"):
-                    raise HTTPException(422, "Every upload must have a .fit extension.")
-                # Server-generated names prevent path traversal and collisions.
                 path = Path(directory) / f"{index}.fit"
-                with path.open("wb") as target:
-                    while chunk := upload.file.read(64 * 1024):
-                        total_bytes += len(chunk)
-                        if total_bytes > MAX_TOTAL_BYTES:
-                            raise HTTPException(413, "Combined FIT payload exceeds 10 MiB.")
-                        target.write(chunk)
+                total_bytes += save_fit_upload(upload, path, MAX_TOTAL_BYTES - total_bytes)
                 try:
                     # Parse separately so that one invalid activity cannot be silently skipped.
                     parsed = heatmap.load_tracks(path.parent, strict=True)
@@ -77,15 +69,93 @@ def create_heatmap(
                 if total_points > MAX_POINTS:
                     raise HTTPException(413, f"Combined activities exceed {MAX_POINTS} GPS points.")
                 tracks.extend(parsed)
-        heat, peak, bounds, _, pixel_m = heatmap.compute_heat(tracks, max_side_px=MAX_SIDE_PX)
-        if not np.any(heat > 0):
-            raise HTTPException(422, "No moving segments remain after time and speed filtering.")
-        image, saturation = heatmap.render_base64(heat, peak)
-        if output == "html":
-            result = heatmap.build_map(bounds, image, len(tracks), saturation, pixel_m)
-            return HTMLResponse(result.get_root().render())
-        return HeatmapResult(image=f"data:image/png;base64,{image}", bounds=bounds,
-                             runs=len(tracks), points=total_points,
-                             pixel_m=pixel_m, saturation=saturation)
+        return render_tracks(tracks, output)
     finally:
         _render_lock.release()
+
+
+def render_tracks(tracks, output="json"):
+    heat, peak, bounds, _, pixel_m = heatmap.compute_heat(tracks, max_side_px=MAX_SIDE_PX)
+    if not np.any(heat > 0):
+        raise HTTPException(422, "No moving segments remain after time and speed filtering.")
+    image, saturation = heatmap.render_base64(heat, peak)
+    if output == "html":
+        result = heatmap.build_map(bounds, image, len(tracks), saturation, pixel_m)
+        return HTMLResponse(result.get_root().render())
+    return HeatmapResult(image=f"data:image/png;base64,{image}", bounds=bounds,
+                         runs=len(tracks), points=sum(len(track[0]) for track in tracks),
+                         pixel_m=pixel_m, saturation=saturation)
+
+
+class GpsPoint(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    latitude: float = Field(gt=-85, lt=85, allow_inf_nan=False)
+    longitude: float = Field(ge=-180, le=180, allow_inf_nan=False)
+    recorded_at: AwareDatetime
+
+
+class GpsTrack(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    points: list[GpsPoint] = Field(min_length=2, max_length=MAX_POINTS)
+
+
+class GpsHeatmapRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    tracks: list[GpsTrack] = Field(min_length=1, max_length=MAX_FILES)
+
+
+@app.post("/heatmaps/waypoints", response_model=HeatmapResult)
+def create_waypoint_heatmap(request: GpsHeatmapRequest):
+    """Internal backend interface. Coordinates are processed without persistence."""
+    if sum(len(track.points) for track in request.tracks) > MAX_POINTS:
+        raise HTTPException(413, f"Combined activities exceed {MAX_POINTS} GPS points.")
+    if not _render_lock.acquire(blocking=False):
+        raise HTTPException(503, "Renderer busy; retry later.", headers={"Retry-After": "2"})
+    try:
+        tracks = []
+        for track in request.tracks:
+            points = sorted(track.points, key=lambda point: point.recorded_at)
+            origin = points[0].recorded_at
+            tracks.append((
+                np.array([(point.recorded_at - origin).total_seconds() for point in points]),
+                np.array([point.latitude for point in points]),
+                np.array([point.longitude for point in points]),
+            ))
+        return render_tracks(tracks)
+    finally:
+        _render_lock.release()
+
+
+def save_fit_upload(upload, path, max_bytes):
+    if not (upload.filename or "").lower().endswith(".fit"):
+        raise HTTPException(422, "Every upload must have a .fit extension.")
+    size = 0
+    with path.open("wb") as target:
+        while chunk := upload.file.read(64 * 1024):
+            size += len(chunk)
+            if size > max_bytes:
+                raise HTTPException(413, "Combined FIT payload exceeds 10 MiB.")
+            target.write(chunk)
+    return size
+
+
+class FitActivity(BaseModel):
+    waypoints: list[GpsPoint] = Field(min_length=2, max_length=MAX_POINTS)
+
+
+@app.post("/fit/parse", response_model=FitActivity)
+def parse_fit(file: Annotated[UploadFile, File()]):
+    """Internal import decoder. Return GPS only; discard the uploaded FIT file."""
+    with TemporaryDirectory(prefix="trail-fit-import-") as directory:
+        path = Path(directory) / "activity.fit"
+        save_fit_upload(file, path, MAX_TOTAL_BYTES)
+        try:
+            points = heatmap.read_fit_points(path, strict=True, max_points=MAX_POINTS)
+            return FitActivity(waypoints=[
+                GpsPoint(latitude=lat, longitude=lon, recorded_at=timestamp)
+                for timestamp, lat, lon in points
+            ])
+        except heatmap.FitPointLimitError as exc:
+            raise HTTPException(413, "FIT activity exceeds the GPS point limit.") from exc
+        except Exception as exc:
+            raise HTTPException(422, "Invalid FIT activity or insufficient supported GPS data.") from exc
