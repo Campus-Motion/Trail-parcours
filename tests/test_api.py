@@ -22,14 +22,18 @@ def crc(data):
     return value
 
 
-def fit_activity(*, latitude=46.5, stationary=False):
+def fit_activity(*, latitude=46.5, stationary=False, health_field=False):
     # FIT record definition: timestamp, latitude, longitude (semicircles).
-    data = struct.pack('<BBBH B', 0x40, 0, 0, 20, 3)
+    data = struct.pack('<BBBH B', 0x40, 0, 0, 20, 4 if health_field else 3)
     data += bytes([253, 4, 0x86, 0, 4, 0x85, 1, 4, 0x85])
+    if health_field:
+        data += bytes([3, 1, 2])  # Heart rate; import must discard it.
     for index in range(5):
         lat = int(latitude / heatmap_v2.SEMICIRCLE)
         lon = int((6.5 + (0 if stationary else index * .0001)) / heatmap_v2.SEMICIRCLE)
         data += struct.pack('<BIii', 0, 1_000_000_000 + index * 5, lat, lon)
+        if health_field:
+            data += bytes([150])
     header = struct.pack('<BBHI4s', 14, 0x20, 2100, len(data), b'.FIT')
     header += struct.pack('<H', crc(header))
     contents = header + data
@@ -113,3 +117,78 @@ def test_grid_limit_includes_blur_margin():
     tracks = [(t, np.array([46., 46.1, 46.2]), np.array([6., 6.1, 6.2]))]
     heat, *_ = heatmap_v2.compute_heat(tracks, max_side_px=128)
     assert max(heat.shape) <= 128
+
+
+def waypoint_request():
+    return {'tracks': [{'points': [
+        {'latitude': 46.5, 'longitude': 6.5 + i * .0001,
+         'recorded_at': f'2026-11-12T12:00:{i * 5:02d}Z'}
+        for i in range(5)
+    ]}]}
+
+
+def test_waypoints_use_the_same_renderer_as_fit():
+    response = client.post('/heatmaps/waypoints', json=waypoint_request())
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result['runs'] == 1 and result['points'] == 5
+    image = Image.open(io.BytesIO(base64.b64decode(result['image'].split(',')[1])))
+    assert np.asarray(image)[:, :, 3].max() > 0
+    assert max(image.size) <= api.MAX_SIDE_PX
+    # An out-of-order source still has chronological route segments.
+    payload = waypoint_request()
+    payload['tracks'][0]['points'].reverse()
+    assert client.post('/heatmaps/waypoints', json=payload).json() == result
+
+
+def test_waypoint_validation_and_limits(monkeypatch):
+    for payload in ({'tracks': []}, {'tracks': [{'points': []}]}):
+        assert client.post('/heatmaps/waypoints', json=payload).status_code == 422
+    payload = waypoint_request()
+    payload['tracks'][0]['points'][0]['latitude'] = 89
+    assert client.post('/heatmaps/waypoints', json=payload).status_code == 422
+    payload = waypoint_request()
+    payload['tracks'][0]['points'][0]['recorded_at'] = '2026-11-12T12:00:00'
+    assert client.post('/heatmaps/waypoints', json=payload).status_code == 422
+    monkeypatch.setattr(api, 'MAX_POINTS', 3)
+    assert client.post('/heatmaps/waypoints', json=waypoint_request()).status_code == 413
+
+
+def test_waypoints_share_busy_lock_and_reject_stationary_data():
+    api._render_lock.acquire()
+    try:
+        assert client.post('/heatmaps/waypoints', json=waypoint_request()).status_code == 503
+    finally:
+        api._render_lock.release()
+    payload = waypoint_request()
+    for point in payload['tracks'][0]['points']:
+        point['longitude'] = 6.5
+    assert client.post('/heatmaps/waypoints', json=payload).status_code == 422
+
+
+
+def test_fit_import_parser_returns_only_absolute_gps_records():
+    response = client.post('/fit/parse', files={'file': ('run.fit', fit_activity(health_field=True))})
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert list(result) == ['waypoints']
+    assert len(result['waypoints']) == 5
+    first = result['waypoints'][0]
+    assert set(first) == {'latitude', 'longitude', 'recorded_at'}
+    assert abs(first['latitude'] - 46.5) < 1e-6
+    assert first['recorded_at'].endswith('Z')
+    # The decoder's output can be passed directly to the existing renderer.
+    rendered = client.post('/heatmaps/waypoints', json={'tracks': [{'points': result['waypoints']}]})
+    assert rendered.status_code == 200
+    assert rendered.json()['points'] == 5
+
+
+def test_fit_import_rejects_corruption_missing_gps_and_limits(monkeypatch):
+    for payload in [b'', b'invalid', fit_activity()[:-1]]:
+        assert client.post('/fit/parse', files={'file': ('run.fit', payload)}).status_code == 422
+    assert client.post('/fit/parse', files={'file': ('run.txt', fit_activity())}).status_code == 422
+    assert client.post('/fit/parse', files={'file': ('run.fit', fit_activity(latitude=89))}).status_code == 422
+    monkeypatch.setattr(api, 'MAX_POINTS', 3)
+    assert client.post('/fit/parse', files={'file': ('run.fit', fit_activity())}).status_code == 413
+    monkeypatch.setattr(api, 'MAX_TOTAL_BYTES', 2)
+    assert client.post('/fit/parse', files={'file': ('run.fit', fit_activity())}).status_code == 413
